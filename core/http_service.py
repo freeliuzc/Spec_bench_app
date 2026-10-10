@@ -83,9 +83,10 @@ class BenchmarkService:
         metadata = build_job_metadata(**raw_metadata)
         if not metadata.model_name:
             raise PipelineError('metadata.model_name is required')
-        timeout = body.get('timeout_seconds', 1800)
-        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
-            raise PipelineError('timeout_seconds must be a finite positive number')
+        timeout = body.get('timeout_seconds')
+        if timeout is not None and (type(timeout) not in (int, float) or
+                                    not math.isfinite(timeout) or timeout <= 0):
+            raise PipelineError('timeout_seconds must be null or a finite positive number')
         defaults = default_parameters(self.settings)
         values = object_fields(body.get('parameters', {}), asdict(defaults))
         for key, value in values.items():
@@ -142,7 +143,8 @@ class BenchmarkService:
                 self.runner.stop(run_id)
                 raise
             self.records[run_id] = record
-            self.deadlines[run_id] = time.monotonic() + request['timeout_seconds']
+            timeout = request['timeout_seconds']
+            self.deadlines[run_id] = None if timeout is None else time.monotonic() + timeout
             monitor = threading.Thread(target=self.monitor, args=(run_id,), daemon=True)
             self.monitors.append(monitor)
             monitor.start()
@@ -221,7 +223,8 @@ class BenchmarkService:
             raise ApiError(500, 'INTERNAL_ERROR', 'Managed benchmark disappeared')
         error = None
         if snapshot.status == STATUS_RUNNING:
-            if time.monotonic() < self.deadlines[run_id]:
+            deadline = self.deadlines[run_id]
+            if deadline is None or time.monotonic() < deadline:
                 return record
             snapshot = self.runner.stop(run_id)
             error = {'code': 'TIMEOUT', 'message': 'Evaluation exceeded timeout_seconds'}

@@ -102,7 +102,7 @@ cat > "$REQUEST_FILE" <<JSON
     "max_concurrency": 4
   },
   "metadata": {"model_name": "my-model"},
-  "timeout_seconds": 1800
+  "timeout_seconds": null
 }
 JSON
 
@@ -113,6 +113,8 @@ echo "请求文件位置：$REQUEST_FILE"
 这段命令会在 `/tmp` 创建本次请求文件，并打印其路径和本次编号。完整参数模板也在
 `examples/evaluation_request.json`，所有可配置字段见第三节。
 未填写的压测参数使用服务端配置默认值。
+`timeout_seconds` 省略或设为 `null` 时，不会因运行超过 30 分钟而自动终止。
+需要限制整次任务时长时，可显式设置正数，例如 `"timeout_seconds": 3600`。
 
 `cat` 后到独立一行的 `JSON` 之间都是文件内容，最后一行 JSON 必须一并复制。
 后面的所有命令继续使用这个终端 B；换了终端需重新设置 API_URL 和实际 RUN_ID。
@@ -306,7 +308,7 @@ submit 和 validate 使用同一结构，未知字段会返回 422，不会静�
 | `run_id` | string | 可选；服务生成 | 以字母、数字、下划线或短横线开头，后续还可含点；不能有 `/`。已有 ID 返回 409 |
 | `parameters` | object | 可省略 | 未提供的参数从服务端配置取默认值 |
 | `metadata` | object | 必填 | 结果命名和部署标签 |
-| `timeout_seconds` | number | 1800 | 从提交启动后计时的服务端最大评测时长，必须有限且大于 0 |
+| `timeout_seconds` | number / null | 可省略；默认 null | 整次评测任务的可选时限（秒）；省略或 null 表示不设置任务时限；数值必须有限且大于 0 |
 
 validate 不保留 ID，不占用 endpoint；校验后仍可能因其他请求占用同一端点而提交失败。
 未提供 run_id 时，validate 中的预览 ID 与随后 submit 自动生成的 ID 可以不同。
@@ -424,7 +426,8 @@ log 的 data 为 `{"run_id":"...","text":"日志内容"}`。
 
 - 状态/结果接口的 `ok: true` 表示查询成功，不能替代 `data.status == "succeeded"`。
 - 调用方停止轮询或 HTTP 连接断开不会自动取消任务；需要时调用取消接口。
-- 服务端 `timeout_seconds` 才会终止 benchmark；停止进程和写结果可能多花几秒。
+- 默认不设置评测任务时限；显式设置 `timeout_seconds` 后，到期停止整次 benchmark，
+  不是限制单条推理请求。它不改变 HTTP 连接或 SGLang 单请求超时；停止进程和写结果可能多花几秒。
 - Ctrl-C/SIGTERM 正常退出会停止自己的运行任务并保存 stopped 记录；不会停止 SGLang。
 - 正常完成的成功、失败、停止结果，重启后仍可查询，无需换接口或解析原始文件。
 - kill -9/崩溃可能留下 benchmark；重启后的首次查询会把未收尾记录标记 failed/INTERRUPTED。
@@ -444,8 +447,9 @@ python -m pytest Spec_bench_app/tests -q
 ```
 
 `tests/test_api.py` 使用临时数据集和 fake benchmark，并通过真实本地 HTTP 请求验证：
-自动收尾（不轮询也保存）、重启恢复、异常结果、非零退出、取消、超时、并发冲突、移除旧路由，
-以及实际 JSON 请求模板 `examples/evaluation_request.json` 的提交和结果查询。
+自动收尾（不轮询也保存）、重启恢复、异常结果、非零退出、取消、显式超时、并发冲突、移除旧路由，
+`test_no_job_deadline_past_thirty_minutes` 用模拟时钟验证省略/null 时限不会在 30 分钟后停止；
+同时验证实际 JSON 请求模板 `examples/evaluation_request.json` 的提交和结果查询。
 `tests/test_api_commands.py` 直接读取并执行本页的终端命令，验证文档与 API 一致。
 测试只监听系统分配的临时端口，结束时关闭监听并检查 benchmark 已结束，不占用 8765。
 
