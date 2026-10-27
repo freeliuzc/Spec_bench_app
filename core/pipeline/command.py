@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shlex
 import uuid
 from datetime import datetime, timezone
@@ -128,10 +129,11 @@ def _validate_parameters(
     if parameters.extra_request_body:
         try:
             extra_body = json.loads(parameters.extra_request_body)
+            json.dumps(extra_body, allow_nan=False)
             if not isinstance(extra_body, dict):
                 errors.append("Extra request body must be a JSON object")
-        except json.JSONDecodeError as exc:
-            errors.append(f"Extra request body is invalid JSON: {exc.msg}")
+        except ValueError as exc:
+            errors.append(f"Extra request body is invalid finite JSON: {exc}")
     if resolved_dataset is not None and not resolved_dataset.is_file():
         errors.append(f"Dataset not found: {resolved_dataset}")
     if errors:
@@ -201,8 +203,7 @@ def build_command_argv(
         )
         argv.extend(["--extra-request-body", compact_body])
     if parameters.output_details:
-        # Valueless flag; SGLang merges the per-request arrays into the same
-        # `result.jsonl` object, so no extra output path is involved.
+        # Per-request arrays share the main result object.
         argv.append("--output-details")
     argv.extend(["--output-file", str(output_file)])
     return argv
@@ -325,7 +326,7 @@ def validate_command(
     else:
         if not Path(argv[0]).expanduser().is_absolute():
             errors.append("Python executable must use an absolute path")
-        executable = Path(argv[0]).expanduser().resolve()
+        executable = Path(os.path.abspath(Path(argv[0]).expanduser()))
         if executable != settings.python_executable:
             errors.append(f"Python executable must remain {settings.python_executable}")
         if tuple(argv[1:3]) != _FIXED_MODULE_ARGS:

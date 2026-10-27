@@ -1,11 +1,14 @@
 """Persistent evaluation lifecycle shared by the HTTP endpoints."""
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from pathlib import Path
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -14,9 +17,58 @@ from .pipeline import (
     BenchmarkRunner, PipelineError, ProcessStateError, STATUS_RUNNING,
     STATUS_SUCCEEDED, STATUS_STOPPED, default_parameters, generate_command,
     validate_command, build_job_metadata, build_saved_benchmark_result,
-    save_benchmark_result, read_log_tail, load_or_create_result_view,
+    save_benchmark_result, read_log_tail, load_or_create_result_view, parse_result_file,
 )
 from .step_curve import accept_curves_to_dict
+
+
+EVIDENCE_VERSION = 1
+EVALUATION_SCHEMA_VERSION = 2
+
+
+def _dataset_hash(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _provenance(settings, argv, request):
+    source = Path(argv[argv.index('--dataset-path') + 1])
+    loader = argv[argv.index('--dataset-name') + 1]
+    dataset_sha256 = _dataset_hash(source)
+    try:
+        revision = subprocess.run(
+            ['git', '-C', str(settings.sglang_repo), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        revision = None
+    parameters = {key: value for key, value in request['parameters'].items()
+                  if key not in ('host', 'port', 'dataset_size')}
+    parameters['request_rate'] = ('inf' if float(parameters['request_rate']) == math.inf
+                                  else str(float(parameters['request_rate'])))
+    parameters['extra_request_body'] = json.loads(parameters['extra_request_body'] or '{}')
+    workload = {'parameters': parameters, 'dataset_sha256': dataset_sha256,
+                'loader': loader}
+    encoded = json.dumps(workload, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    return {'evidence_version': EVIDENCE_VERSION, 'evidence_level': 'dataset-and-config',
+            'dataset_sha256': dataset_sha256,
+            'workload_sha256': hashlib.sha256(encoded.encode()).hexdigest(),
+            'dataset': {'path': str(source), 'loader': loader},
+            'benchmark': {'python_executable': str(settings.python_executable),
+                          'sglang_repo': str(settings.sglang_repo),
+                          'sglang_revision': revision}}
+
+
+def _raw_result(path):
+    raw = parse_result_file(path)
+    if not raw:
+        raise ValueError('Result file is missing or empty')
+    if type(raw.get('request_rate')) is float and raw['request_rate'] == math.inf:
+        raw['request_rate'] = 'inf'
+    json.dumps(raw, allow_nan=False)
+    return raw
 
 
 class ApiError(Exception):
@@ -121,14 +173,18 @@ class BenchmarkService:
         with self.lock:
             if self.closing:
                 raise ApiError(503, 'SHUTTING_DOWN', 'API is shutting down')
-            command, _, metadata, request = self.prepare(body)
+            command, validated, metadata, request = self.prepare(body)
+            provenance = _provenance(self.settings, validated.argv, request)
             snapshot = self.runner.start(command, self.settings, metadata=metadata)
             run_id = snapshot.run_id
             record = {
-                'schema_version': 1, 'run_id': run_id, 'status': 'running',
+                'schema_version': EVALUATION_SCHEMA_VERSION,
+                'evaluation_schema_version': EVALUATION_SCHEMA_VERSION,
+                'run_id': run_id, 'status': 'running',
                 'started_at': snapshot.started_at.isoformat(), 'ended_at': None,
                 'return_code': None, 'error': None, 'request': request,
                 'command': command, 'metrics': {}, 'values': {}, 'curves': None,
+                'raw_result': None, 'provenance': provenance,
                 'log_tail': '', 'artifacts': {
                     'evaluation': str(self.path(run_id)),
                     'result_jsonl': str(snapshot.output_file),
@@ -185,15 +241,19 @@ class BenchmarkService:
                                        'message': f'Benchmark exited with code {snapshot.return_code}'}
         else:
             try:
+                provenance = record['provenance']
+                if _dataset_hash(Path(provenance['dataset']['path'])) != provenance['dataset_sha256']:
+                    raise ValueError('Dataset changed during benchmark')
+                raw_result = _raw_result(snapshot.output_file)
                 view = load_or_create_result_view(snapshot.output_file)
                 if view is None:
                     raise ValueError('Result file is missing or empty')
-                result.update(metrics=dict(view.metrics), values=dict(view.values),
+                result.update(raw_result=raw_result, metrics=dict(view.metrics), values=dict(view.values),
                               curves=accept_curves_to_dict(view.curves))
                 # Catch non-finite result data before writing any success record.
                 json.dumps(result, allow_nan=False)
             except (ValueError, TypeError, PipelineError, OSError) as exc:
-                result.update(metrics={}, values={}, curves=None,
+                result.update(raw_result=None, metrics={}, values={}, curves=None,
                               error={'code': 'INVALID_RESULT', 'message': str(exc)})
             else:
                 metadata = snapshot.metadata
@@ -255,7 +315,7 @@ class BenchmarkService:
     @staticmethod
     def summary(record):
         return {key: record[key] for key in (
-            'run_id', 'status', 'started_at', 'ended_at', 'return_code', 'error')}
+            'run_id', 'status', 'started_at', 'ended_at', 'return_code', 'error', 'request')}
 
     def status(self, run_id):
         with self.lock:

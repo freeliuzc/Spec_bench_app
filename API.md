@@ -39,7 +39,8 @@ python api.py --host 127.0.0.1 --port 8765
 | environment.workspace_root | 评测日志、原始结果和持久评测记录目录 |
 | environment.saved_results_root | 成功评测自动生成的页面兼容结果记录目录 |
 
-相对路径以配置文件所在目录为基准。
+相对路径以配置文件所在目录为基准。Python launcher 保留配置中的绝对路径，
+即使它是 venv 的符号链接，也不会替换为系统 Python。
 被测 SGLang 必须已经启动；API 只启动 benchmark，不负责部署或启动 SGLang。
 
 下面示例使用两个地址：
@@ -362,7 +363,8 @@ cancel 无需请求体，或使用 `{}`。log 的 max_bytes 范围为 1–419430
 }
 ```
 
-submit、状态查询、cancel 的 `data` 字段一致，例如：
+submit、状态查询、cancel 的 `data` 字段一致，并包含补齐默认值后的 `request`。
+提交响应丢失时，可用预先指定的 run_id 查询并核对 request；不要再次提交。状态字段示例：
 
 ```json
 {
@@ -382,15 +384,39 @@ result 接口 `data` 包含以下完整字段：
 
 | 字段 | 内容 |
 |---|---|
-| `schema_version` | 当前为 1 |
+| `schema_version/evaluation_schema_version` | 新记录当前均为 2 |
 | `run_id/status/started_at/ended_at/return_code/error` | 与状态接口相同 |
 | `request` | 补齐默认值后的请求，包含实际 run_id |
 | `command` | 执行的 benchmark 命令，便于复核 |
+| `raw_result` | benchmark 最后一行 JSON 的持久快照；包含原生逐请求数组（启用 output_details 时），解析失败时为 null |
+| `provenance` | 数据文件和配置来源摘要，字段见下表 |
 | `metrics` | accept_length、decode_speed_toks、request/input/output/total_throughput、mean_e2e_latency_ms、mean_ttft_ms、mean_tpot_ms、mean_itl_ms |
 | `values` | 更多可比较的 client.* / server.* 标量字段，具体键取决于 benchmark 输出 |
 | `curves` | 已有的最好/最差请求接受长度曲线；没有 detailed 统计时为 null |
 | `log_tail` | 结束时的 benchmark 日志尾部（最多 64 KiB） |
 | `artifacts` | evaluation、result_jsonl、benchmark_log、result_view、saved_record 的服务端路径；未保存成功时 saved_record 为 null |
+
+`raw_result` 和 `provenance` 保存于 evaluation.json；原始结果、缓存或数据文件删除后，
+终态结果仍可读取，API 重启后保持一致。旧记录不会自动补造缺失的来源证据。
+仅原生配置字段 `raw_result.request_rate` 的正 Infinity 转为字符串 `"inf"`；
+任何其他非有限数值（包括指标和嵌套数据）均使结果失败。
+
+| provenance 字段 | 内容 |
+|---|---|
+| `evidence_version` | 当前为 1 |
+| `evidence_level` | 固定 `dataset-and-config` |
+| `dataset_sha256` | benchmark 实际读取的 --dataset-path 文件内容 SHA-256；开始前和成功收尾时核对 |
+| `workload_sha256` | 数据摘要、loader 和规范化请求参数的 SHA-256；排除 host、port、dataset_size 别名和任务标签 |
+| `dataset.path/loader` | 实际 benchmark 文件路径和 --dataset-name loader |
+| `benchmark.python_executable/sglang_repo/sglang_revision` | 配置的 Python launcher、仓库路径及 git HEAD；非 Git 仓库或读取失败时 revision 为 null |
+
+workload 摘要使用排序的紧凑 JSON；request_rate 规范为数值字符串或 `"inf"`，
+extra_request_body 解析为 JSON 对象。metadata、run_id 和 timeout 不参与摘要。
+这些证据证明数据文件和配置一致，不证明随机选择后实际请求的消息、模板或 token 一致。
+数据文件在任务期间变化或消失时，结果为 INVALID_RESULT，不保存成功比较记录。
+仓库 revision 是观察到的版本，不代表工作树干净，也不保证与调用方依赖锁一致。
+`output_details=false` 仍允许已有页面/API 客户端成功；需要核对完整完成数的调用方应开启它，
+并检查 completed、errors、generated_texts、output_lens 与预期请求数。
 
 `metrics.accept_length` 是每次验证步的平均接受长度，不是 draft 接受率。
 API 沿用已有接受长度统计，不生成新的接受率报告。
@@ -417,7 +443,7 @@ log 的 data 为 `{"run_id":"...","text":"日志内容"}`。
 | code | 含义与处理 |
 |---|---|
 | BENCHMARK_FAILED | benchmark 非零退出；查看 return_code 和 log_tail |
-| INVALID_RESULT | 结果缺失、损坏或没有可用指标；查看原始日志 |
+| INVALID_RESULT | 结果缺失/损坏、非有限数据、没有可用指标或数据文件变化；查看原始日志 |
 | CANCELLED | 主动取消或服务正常退出时停止任务 |
 | TIMEOUT | 服务端 timeout_seconds 到期，benchmark 被停止 |
 | SAVE_FAILED | 成功解析，但页面兼容记录保存失败；检查存储路径/权限 |
