@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 try:
@@ -18,11 +19,13 @@ from .models import (
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "benchmark_pipeline.toml"
 
 
-def _resolve_config_path(raw_path: str, base_dir: Path) -> Path:
+def _resolve_config_path(
+    raw_path: str, base_dir: Path, *, follow_symlinks: bool = True
+) -> Path:
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = base_dir / path
-    return path.resolve()
+    return path.resolve() if follow_symlinks else Path(os.path.abspath(path))
 
 
 def load_settings(config_path: str | Path = CONFIG_PATH) -> PipelineSettings:
@@ -58,7 +61,7 @@ def load_settings(config_path: str | Path = CONFIG_PATH) -> PipelineSettings:
         )
         return PipelineSettings(
             python_executable=_resolve_config_path(
-                str(environment["python_executable"]), base_dir
+                str(environment["python_executable"]), base_dir, follow_symlinks=False
             ),
             sglang_repo=_resolve_config_path(str(environment["sglang_repo"]), base_dir),
             dataset_root=_resolve_config_path(

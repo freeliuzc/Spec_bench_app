@@ -989,3 +989,46 @@ def test_log_tail_limits_large_logs(tmp_path: Path) -> None:
 
     assert "latest" in tail
     assert "log truncated" in tail
+
+
+def test_venv_python_launcher_survives_config_validation_and_spawn(pipeline_setup, tmp_path):
+    from dataclasses import asdict
+    import subprocess
+    from ..core.pipeline import load_settings
+
+    settings, parameters = pipeline_setup
+    venv = tmp_path / 'runtime'
+    subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(venv)], check=True)
+    launcher = venv / 'bin/python'
+    assert launcher.is_symlink()
+    environment = {key: str(getattr(settings, key)) for key in (
+        'sglang_repo', 'dataset_root', 'workspace_root', 'saved_results_root', 'builtin_dataset_root')}
+    environment['python_executable'] = 'runtime/bin/python'
+    defaults = {key: value for key, value in asdict(parameters).items() if hasattr(settings, key)}
+    config = tmp_path / 'deployment.toml'
+    lines = ['[environment]']
+    lines.extend(f'{key} = {json.dumps(value)}' for key, value in environment.items())
+    lines.append('[defaults]')
+    lines.extend(f'{key} = {str(value).lower() if isinstance(value, bool) else json.dumps(value)}'
+                 for key, value in defaults.items())
+    lines.append('ready_timeout = 1')
+    config.write_text('\n'.join(lines))
+    configured = load_settings(config)
+    assert configured.python_executable == launcher
+    assert configured.python_executable != launcher.resolve()
+    module = settings.sglang_repo / 'python/sglang/benchmark/serving.py'
+    module.write_text(module.read_text().replace('print("fake benchmark started", flush=True)',
+                      'import sys\nprint("runtime-prefix=" + sys.prefix, flush=True)'))
+    command, run_id = generate_command(configured, parameters, 'venv-runtime')
+    validated = validate_command(command, configured)
+    assert validated.argv[0] == str(launcher)
+    with pytest.raises(CommandValidationError, match='Python executable must remain'):
+        validate_command(command.replace(str(launcher), str(launcher.resolve())), configured)
+    runner = BenchmarkRunner()
+    snapshot = runner.start(command, configured)
+    deadline = time.monotonic() + 5
+    while snapshot.status == 'Running' and time.monotonic() < deadline:
+        time.sleep(.02)
+        snapshot = runner.snapshot(run_id)
+    assert snapshot.status == STATUS_SUCCEEDED
+    assert 'runtime-prefix=' + str(venv) in snapshot.log_file.read_text()

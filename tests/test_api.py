@@ -8,9 +8,11 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import pytest
 from ..api import create_server
-from ..core.pipeline import runner as runner_module
+from ..core import http_service
+from ..core.pipeline import PipelineError, runner as runner_module
 from .test_benchmark_pipeline import pipeline_setup
 
 class HTTPFailure(Exception):
@@ -56,14 +58,16 @@ def wait(request, run_id):
         time.sleep(0.02)
     pytest.fail('Evaluation did not finish')
 
-def test_full_workflow_autosaves_without_polling_and_survives_restart(pipeline_setup):
+@pytest.mark.parametrize('extra', [{}, {'timeout_seconds': None}])
+def test_full_workflow_autosaves_without_polling_and_survives_restart(pipeline_setup, extra):
     settings, _ = pipeline_setup
     with running_server(settings) as (request, server):
         assert request('GET', '/health')['status'] == 'ok'
-        validated = request('POST', '/api/v1/evaluations/validate', job('first'))
+        validated = request('POST', '/api/v1/evaluations/validate', job('first', **extra))
         assert validated['valid']
+        assert validated['request']['timeout_seconds'] is None
         assert not (settings.workspace_root / 'first').exists()
-        assert request('POST', '/api/v1/evaluations', job('first'))['run_id'] == 'first'
+        assert request('POST', '/api/v1/evaluations', job('first', **extra))['run_id'] == 'first'
         path = settings.workspace_root / 'first/evaluation.json'
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -74,6 +78,7 @@ def test_full_workflow_autosaves_without_polling_and_survives_restart(pipeline_s
         assert record['status'] == 'succeeded'
         result = request('GET', '/api/v1/evaluations/first/result')
         assert result['metrics']['accept_length'] == 1.5
+        assert result['request']['timeout_seconds'] is None
         assert Path(result['artifacts']['saved_record']).is_file()
         assert 'completed' in request('GET', '/api/v1/evaluations/first/log')['text']
         assert request('POST', '/api/v1/evaluations/first:cancel')['status'] == 'succeeded'
@@ -84,7 +89,7 @@ def test_full_workflow_autosaves_without_polling_and_survives_restart(pipeline_s
         assert 'completed' in request('GET', '/api/v1/evaluations/first/log')['text']
         assert request('POST', '/api/v1/evaluations/first:cancel')['status'] == 'succeeded'
         with pytest.raises(HTTPFailure) as exc:
-            request('POST', '/api/v1/evaluations', job('first'))
+            request('POST', '/api/v1/evaluations', job('first', **extra))
         assert exc.value.status == 409
 
 @pytest.mark.parametrize('output', [None, '{broken', '{}'])
@@ -133,7 +138,68 @@ def test_concurrent_conflict_cancel_timeout_shutdown(pipeline_setup):
     with running_server(settings) as (request, _):
         assert request('GET', '/api/v1/evaluations/shutdown/result')['status'] == 'stopped'
 
-@pytest.mark.parametrize('extra', [{'parameters': {'num_prompts': True}}, {'parameters': {'port': '80'}}, {'parameters': {'request_rate': 'nan'}}, {'parameters': {'dataset_id': 'unknown'}}, {'metadata': {'model_name': None}}, {'parameters': {'typo': 1}}, {'run_id': '..'}, {'run_id': 'x/y'}, {'metadata': {'tp_size': 1.5}}, {'timeout_seconds': 0}, {'timeout_seconds': '10'}, {'command': 'echo no'}])
+@pytest.mark.parametrize('extra', [{}, {'timeout_seconds': None}])
+def test_no_job_deadline_past_thirty_minutes(pipeline_setup, monkeypatch, extra):
+    settings, _ = pipeline_setup
+    module = settings.sglang_repo / 'python/sglang/benchmark/serving.py'
+    module.write_text('import time\ntime.sleep(30)\n')
+    clock = [1000.0]
+    monkeypatch.setattr(http_service, 'time', SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=time.sleep))
+    with running_server(settings) as (request, server):
+        request('POST', '/api/v1/evaluations', job('unlimited', **extra))
+        with server.service.lock:
+            clock[0] += 1801
+        assert request('GET', '/api/v1/evaluations/unlimited')['status'] == 'running'
+        record = json.loads((settings.workspace_root / 'unlimited/evaluation.json').read_text())
+        assert record['request']['timeout_seconds'] is None
+        assert request('POST', '/api/v1/evaluations/unlimited:cancel')['status'] == 'stopped'
+        result = request('GET', '/api/v1/evaluations/unlimited/result')
+        assert result['error']['code'] == 'CANCELLED'
+    with running_server(settings) as (request, _):
+        assert request('GET', '/api/v1/evaluations/unlimited/result') == result
+
+
+@pytest.mark.parametrize('timeout', [5, 5.5])
+def test_explicit_job_deadline_still_stops_benchmark(pipeline_setup, monkeypatch, timeout):
+    settings, _ = pipeline_setup
+    module = settings.sglang_repo / 'python/sglang/benchmark/serving.py'
+    module.write_text('import time\ntime.sleep(30)\n')
+    clock = [1000.0]
+    monkeypatch.setattr(http_service, 'time', SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=time.sleep))
+    with running_server(settings) as (request, server):
+        request('POST', '/api/v1/evaluations', job('bounded', timeout_seconds=timeout))
+        with server.service.lock:
+            clock[0] += timeout - 0.01
+        assert request('GET', '/api/v1/evaluations/bounded')['status'] == 'running'
+        with server.service.lock:
+            clock[0] = 1000.0 + timeout
+        assert request('GET', '/api/v1/evaluations/bounded')['status'] == 'stopped'
+        result = request('GET', '/api/v1/evaluations/bounded/result')
+        assert result['error']['code'] == 'TIMEOUT'
+        assert result['request']['timeout_seconds'] == timeout
+    with running_server(settings) as (request, _):
+        assert request('GET', '/api/v1/evaluations/bounded/result') == result
+
+
+@pytest.mark.parametrize('timeout', [float('nan'), float('inf'), -float('inf')])
+def test_nonfinite_job_deadline_rejected_by_service(pipeline_setup, timeout):
+    settings, _ = pipeline_setup
+    with pytest.raises(PipelineError, match='finite positive number'):
+        http_service.BenchmarkService(settings).prepare(job('invalid', timeout_seconds=timeout))
+
+
+@pytest.mark.parametrize('extra', [
+    {'parameters': {'num_prompts': True}}, {'parameters': {'port': '80'}},
+    {'parameters': {'request_rate': 'nan'}}, {'parameters': {'dataset_id': 'unknown'}},
+    {'metadata': {'model_name': None}}, {'parameters': {'typo': 1}},
+    {'run_id': '..'}, {'run_id': 'x/y'}, {'metadata': {'tp_size': 1.5}},
+    {'timeout_seconds': 0}, {'timeout_seconds': -1}, {'timeout_seconds': True},
+    {'timeout_seconds': False}, {'timeout_seconds': '10'}, {'timeout_seconds': 'null'},
+    {'command': 'echo no'},
+    {'parameters': {'extra_request_body': '{"temperature":NaN}'}},
+])
 def test_validation_errors_are_422(pipeline_setup, extra):
     settings, _ = pipeline_setup
     with running_server(settings) as (request, _):
@@ -221,3 +287,81 @@ def test_save_failure_is_not_published_as_success(pipeline_setup, monkeypatch):
         assert request('GET', '/api/v1/evaluations/save-failure')['status'] == 'failed'
     with running_server(settings) as (request, _):
         assert request('GET', '/api/v1/evaluations/save-failure/result') == result
+
+
+def test_raw_evidence_survives_restart_and_source_deletion(pipeline_setup):
+    settings, _ = pipeline_setup
+    module = settings.sglang_repo / 'python/sglang/benchmark/serving.py'
+    source = module.read_text()
+    additions = '''result.update(request_rate=float('inf'), errors=['', ''],
+                           generated_texts=['hello', 'world'], output_lens=[1, 1])'''
+    module.write_text(source.replace('output = Path(args.output_file)', additions + '\noutput = Path(args.output_file)'))
+    with running_server(settings) as (request, _):
+        submitted = request('POST', '/api/v1/evaluations', job('evidence', parameters={'output_details': True}))
+        assert submitted['request']['parameters']['output_details'] is True
+        assert request('GET', '/api/v1/evaluations/evidence')['request'] == submitted['request']
+        result = wait(request, 'evidence')
+        assert result['status'] == 'succeeded'
+        assert result['evaluation_schema_version'] == 2
+        assert result['raw_result']['request_rate'] == 'inf'
+        assert result['raw_result']['errors'] == ['', '']
+        assert result['raw_result']['generated_texts'] == ['hello', 'world']
+        assert result['raw_result']['output_lens'] == [1, 1]
+        assert result['provenance']['evidence_version'] == 1
+        assert result['provenance']['evidence_level'] == 'dataset-and-config'
+        assert len(result['provenance']['dataset_sha256']) == 64
+        assert len(result['provenance']['workload_sha256']) == 64
+    (settings.workspace_root / 'evidence/result.jsonl').unlink()
+    (settings.workspace_root / 'evidence/result_view.json').unlink()
+    Path(result['provenance']['dataset']['path']).unlink()
+    with running_server(settings) as (request, _):
+        assert request('GET', '/api/v1/evaluations/evidence/result') == result
+
+
+def test_dataset_mutation_invalidates_success(pipeline_setup):
+    settings, _ = pipeline_setup
+    module = settings.sglang_repo / 'python/sglang/benchmark/serving.py'
+    module.write_text(module.read_text().replace('default=0.05', 'default=0.3'))
+    with running_server(settings) as (request, _):
+        request('POST', '/api/v1/evaluations', job('changed'))
+        dataset = settings.dataset_root / 'throughput_1k/test.jsonl'
+        dataset.write_text(dataset.read_text() + '\n')
+        result = wait(request, 'changed')
+        assert result['status'] == 'failed'
+        assert result['error']['code'] == 'INVALID_RESULT'
+        assert 'Dataset changed' in result['error']['message']
+        assert result['artifacts']['saved_record'] is None
+
+
+@pytest.mark.parametrize('key,value', [('output_throughput', "float('inf')"),
+                                      ('mean_ttft_ms', "float('nan')"),
+                                      ('request_rate', "-float('inf')"),
+                                      ('generated_texts', "[float('inf')]")])
+def test_nonfinite_raw_result_is_failure(pipeline_setup, key, value):
+    settings, _ = pipeline_setup
+    module = settings.sglang_repo / 'python/sglang/benchmark/serving.py'
+    module.write_text(module.read_text().replace('output = Path(args.output_file)',
+                                               f'result[{key!r}] = {value}\noutput = Path(args.output_file)'))
+    with running_server(settings) as (request, _):
+        request('POST', '/api/v1/evaluations', job('nonfinite'))
+        result = wait(request, 'nonfinite')
+        assert result['status'] == 'failed'
+        assert result['error']['code'] == 'INVALID_RESULT'
+        assert result['raw_result'] is None
+
+
+def test_workload_digest_excludes_endpoint_and_job_labels(pipeline_setup):
+    settings, _ = pipeline_setup
+    service = http_service.BenchmarkService(settings)
+    first = job('first')
+    second = job('second', parameters={'host': 'another-host', 'port': 9001},
+                 timeout_seconds=5)
+    second['metadata']['additional'] = 'mode=baseline'
+    fingerprints = []
+    for body in (first, second):
+        _, validated, _, request = service.prepare(body)
+        fingerprints.append(http_service._provenance(settings, validated.argv, request))
+    assert fingerprints[0]['workload_sha256'] == fingerprints[1]['workload_sha256']
+    _, validated, _, request = service.prepare(job('third', parameters={'output_len': 9}))
+    changed = http_service._provenance(settings, validated.argv, request)
+    assert changed['workload_sha256'] != fingerprints[0]['workload_sha256']
